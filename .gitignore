@@ -9,5 +9,14 @@
 package-lock.json
 yarn.lock
 node_modules
-**/crates/AppFlowy-Collab/
+**/libs/AppFlowy-Collab/
 data/
+.env
+.logs
+flake.nix
+flake.lock
+.envrc
+.direnv/
+
+**/.DS_Store
+**/.env.*
