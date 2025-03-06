@@ -1,45 +1,56 @@
+use crate::config::config::Environment;
 use actix_web::rt::task::JoinHandle;
+use chrono::Local;
 use tracing::subscriber::set_global_default;
-use tracing::Subscriber;
-use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
-use tracing_log::LogTracer;
-
-use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
-
-/// Compose multiple layers into a `tracing`'s subscriber.
-pub fn get_subscriber<Sink>(
-  name: String,
-  env_filter: String,
-  sink: Sink,
-) -> impl Subscriber + Sync + Send
-where
-  Sink: for<'a> MakeWriter<'a> + Send + Sync + 'static,
-{
-  let env_filter = match EnvFilter::try_from_default_env() {
-    Ok(env_filter) => {
-      dbg!("Using default env filter");
-      env_filter
-    },
-    Err(_) => EnvFilter::new(env_filter),
-  };
-  let formatting_layer = BunyanFormattingLayer::new(name, sink);
-  tracing_subscriber::fmt()
-    .with_ansi(true)
-    .with_target(true)
-    .with_max_level(tracing::Level::TRACE)
-    .finish()
-    .with(env_filter)
-    .with(JsonStorageLayer)
-    .with(formatting_layer)
-}
 
 /// Register a subscriber as global default to process span data.
 ///
 /// It should only be called once!
-pub fn init_subscriber(subscriber: impl Subscriber + Sync + Send) {
-  LogTracer::init().expect("Failed to set logger");
-  set_global_default(subscriber).expect("Failed to set subscriber");
+pub fn init_subscriber(app_env: &Environment, filters: Vec<String>) {
+  let env_filter = EnvFilter::new(filters.join(","));
+
+  let builder = tracing_subscriber::fmt()
+    .with_target(true)
+    .with_max_level(tracing::Level::TRACE)
+    .with_thread_ids(false)
+    .with_file(true)
+    .with_line_number(true);
+
+  match app_env {
+    Environment::Local => {
+      #[cfg(feature = "tokio-runtime-profile")]
+      console_subscriber::ConsoleLayer::builder()
+        .retention(std::time::Duration::from_secs(60))
+        .init();
+
+      #[cfg(not(feature = "tokio-runtime-profile"))]
+      {
+        let subscriber = builder
+          .with_ansi(true)
+          .with_timer(CustomTime)
+          .with_target(false)
+          .with_file(false)
+          .pretty()
+          .finish()
+          .with(env_filter);
+        set_global_default(subscriber).unwrap();
+      }
+    },
+    Environment::Production => {
+      let subscriber = builder.json().finish().with(env_filter);
+      set_global_default(subscriber).unwrap();
+    },
+  }
+}
+
+#[allow(dead_code)]
+struct CustomTime;
+impl tracing_subscriber::fmt::time::FormatTime for CustomTime {
+  fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+    write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))
+  }
 }
 
 pub fn spawn_blocking_with_tracing<F, R>(f: F) -> JoinHandle<R>
