@@ -1,0 +1,168 @@
+name: AppFlowy-Cloud Integrations
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'libs/**'
+      - 'services/**'
+      - 'admin_frontend/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'libs/**'
+      - 'services/**'
+      - 'admin_frontend/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  LOCALHOST_URL: http://localhost
+  LOCALHOST_WS: ws://localhost/ws/v1
+  APPFLOWY_REDIS_URI: redis://redis:6379
+  APPFLOWY_AI_REDIS_URL: redis://redis:6379
+  LOCALHOST_GOTRUE: http://localhost/gotrue
+  POSTGRES_PASSWORD: password
+  DATABASE_URL: postgres://postgres:password@localhost:5432/postgres
+  SQLX_OFFLINE: true
+  RUST_TOOLCHAIN: "1.80"
+
+jobs:
+  setup:
+    name: Setup Environment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install protobuf-compiler
+          sudo update-ca-certificates
+
+      - name: Build Docker Images
+        run: |
+          export DOCKER_DEFAULT_PLATFORM=linux/amd64
+          cp deploy.env .env
+          docker compose build appflowy_cloud  appflowy_worker admin_frontend
+
+      - name: Push docker images to docker hub
+        run: |
+          docker tag appflowyinc/appflowy_cloud appflowyinc/appflowy_cloud:${GITHUB_SHA}
+          docker tag appflowyinc/appflowy_worker appflowyinc/appflowy_worker:${GITHUB_SHA}
+          docker tag appflowyinc/admin_frontend appflowyinc/admin_frontend:${GITHUB_SHA}
+          echo ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }} | docker login --username appflowyinc --password-stdin
+          docker push appflowyinc/appflowy_cloud:${GITHUB_SHA}
+          docker push appflowyinc/appflowy_worker:${GITHUB_SHA}
+          docker push appflowyinc/admin_frontend:${GITHUB_SHA}
+          APPFLOWY_WORKER_VERSION=${GITHUB_SHA}
+          APPFLOWY_CLOUD_VERSION=${GITHUB_SHA}
+          APPFLOWY_ADMIN_FRONTEND_VERSION=${GITHUB_SHA}
+
+  test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: setup
+    strategy:
+      matrix:
+        include:
+          - test_service: "appflowy_cloud"
+            test_cmd: "--workspace --exclude appflowy-ai-client --features ai-test-enabled"
+          - test_service: "appflowy_worker"
+            test_cmd: "-p appflowy-worker"
+          - test_service: "admin_frontend"
+            test_cmd: "-p admin_frontend"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          workspaces: "AppFlowy-Cloud"
+
+      - name: Copy and rename deploy.env to .env
+        run: cp deploy.env .env
+
+      - name: Replace values in .env
+        run: |
+          # log level
+          sed -i 's|RUST_LOG=.*|RUST_LOG=trace|' .env
+          sed -i 's|GOTRUE_SMTP_USER=.*|GOTRUE_SMTP_USER=${{ secrets.CI_GOTRUE_SMTP_USER }}|' .env
+          sed -i 's|GOTRUE_SMTP_PASS=.*|GOTRUE_SMTP_PASS=${{ secrets.CI_GOTRUE_SMTP_PASS }}|' .env
+          sed -i 's|GOTRUE_SMTP_ADMIN_EMAIL=.*|GOTRUE_SMTP_ADMIN_EMAIL=${{ secrets.CI_GOTRUE_SMTP_ADMIN_EMAIL }}|' .env
+          sed -i 's|GOTRUE_EXTERNAL_GOOGLE_ENABLED=.*|GOTRUE_EXTERNAL_GOOGLE_ENABLED=true|' .env
+          sed -i 's|GOTRUE_MAILER_AUTOCONFIRM=.*|GOTRUE_MAILER_AUTOCONFIRM=false|' .env
+          sed -i 's|API_EXTERNAL_URL=http://your-host/gotrue|API_EXTERNAL_URL=http://localhost/gotrue|' .env
+          sed -i 's|GOTRUE_RATE_LIMIT_EMAIL_SENT=100|GOTRUE_RATE_LIMIT_EMAIL_SENT=1000|' .env
+          sed -i 's|APPFLOWY_MAILER_SMTP_USERNAME=.*|APPFLOWY_MAILER_SMTP_USERNAME=${{ secrets.CI_GOTRUE_SMTP_USER }}|' .env
+          sed -i 's|APPFLOWY_MAILER_SMTP_PASSWORD=.*|APPFLOWY_MAILER_SMTP_PASSWORD=${{ secrets.CI_GOTRUE_SMTP_PASS }}|' .env
+          sed -i 's|AI_OPENAI_API_KEY=.*|AI_OPENAI_API_KEY=${{ secrets.CI_OPENAI_API_KEY }}|' .env
+          sed -i "s|AI_AWS_ACCESS_KEY_ID=.*|AI_AWS_ACCESS_KEY_ID=${{ secrets.LOCAL_AI_AWS_ACCESS_KEY_ID }}|" .env
+          sed -i "s|AI_AWS_SECRET_ACCESS_KEY=.*|AI_AWS_SECRET_ACCESS_KEY=${{ secrets.LOCAL_AI_AWS_SECRET_ACCESS_KEY }}|" .env
+          sed -i 's|AI_APPFLOWY_HOST=.*|AI_APPFLOWY_HOST=http://localhost|' .env
+          sed -i 's|APPFLOWY_WEB_URL=.*|APPFLOWY_WEB_URL=http://localhost:3000|' .env
+          sed -i 's|.*APPFLOWY_S3_PRESIGNED_URL_ENDPOINT=.*|APPFLOWY_S3_PRESIGNED_URL_ENDPOINT=http://localhost/minio-api|' .env
+        shell: bash
+
+      - name: Update Nginx Configuration
+        # the wasm-pack headless tests will run on random ports, so we need to allow all origins
+        run: sed -i 's/http:\/\/127\.0\.0\.1:8000/http:\/\/127.0.0.1/g' nginx/nginx.conf
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Run Docker-Compose
+        run: |
+          export APPFLOWY_WORKER_VERSION=${GITHUB_SHA}
+          export APPFLOWY_CLOUD_VERSION=${GITHUB_SHA}
+          export APPFLOWY_ADMIN_FRONTEND_VERSION=${GITHUB_SHA}
+          docker compose -f docker-compose-ci.yml up -d
+          docker ps -a
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Run Tests
+        run: |
+          echo "Running tests for ${{ matrix.test_service }} with flags: ${{ matrix.test_cmd }}"
+          RUST_LOG="info" DISABLE_CI_TEST_LOG="true" cargo test ${{ matrix.test_cmd }} -- --skip stress_test
+
+      - name: Server Logs
+        if: failure()
+        run: |
+          docker ps -a
+          docker compose -f docker-compose-ci.yml logs
+
+      - name: AI Logs
+        if: always()
+        run: |
+          docker logs appflowy-cloud-ai-1
+
+  cleanup:
+    name: Cleanup Docker Images
+    if: always()
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove Docker Images from Docker Hub
+        run: |
+          TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d '{"username": "appflowyinc", "password": "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}"}' https://hub.docker.com/v2/users/login/ | jq -r .token)
+          if [ -z "$TOKEN" ]; then
+            echo "Error: Docker Hub token not set"
+            exit 1
+          fi
+          IMAGE_TAG="${{ matrix.test_service }}"
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: JWT ${TOKEN}" https://hub.docker.com/v2/repositories/appflowyinc/${IMAGE_TAG}/tags/${GITHUB_SHA}/)
+          if [ "$RESPONSE" -ne 204 ]; then
+            echo "Error: Failed to delete Docker image tag. HTTP response code: $RESPONSE"
+          else
+            echo "Successfully deleted Docker image tag for $IMAGE_TAG:${GITHUB_SHA}"
+          fi
